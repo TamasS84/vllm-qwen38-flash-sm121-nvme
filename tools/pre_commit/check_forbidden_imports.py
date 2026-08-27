@@ -48,6 +48,8 @@ CHECK_IMPORTS = {
             "vllm/distributed/device_communicators/shm_object_storage.py",
             "vllm/distributed/weight_transfer/ipc_engine.py",
             "vllm/distributed/weight_transfer/clients.py",
+            # PLE registration reconstructs CUDA IPC and shared-memory tensors.
+            "vllm/v1/ple_offload/worker.py",
             "tests/distributed/test_shm_broadcast.py",
             "tests/distributed/test_weight_transfer.py",
             "vllm/utils/hashing.py",
@@ -82,7 +84,11 @@ CHECK_IMPORTS = {
         pattern=r"^\s*(?:import\s+re(?:$|\s|,)|from\s+re\s+import)",
         tip="Replace 'import re' with 'import regex as re' or 'import regex'.",
         allowed_pattern=re.compile(r"^\s*import\s+regex(\s*|\s+as\s+re\s*)$"),
-        allowed_files={"setup.py"},
+        allowed_files={
+            "setup.py",
+            # This standalone builder runs before vLLM is installed.
+            "tools/prepare_ple_nvme.py",
+        },
     ),
     "triton": ForbiddenImport(
         pattern=r"^(from|import)\s+triton(\s|\.|$)",

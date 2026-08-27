@@ -80,6 +80,15 @@ def enable_xet_high_performance():
 enable_xet_high_performance()
 
 
+def _is_ple_offload_process() -> bool:
+    if not envs.VLLM_PLE_CPU_OFFLOAD:
+        return False
+
+    from vllm.model_executor.layers.ple_offload_layer import is_offload_process
+
+    return is_offload_process()
+
+
 class DisabledTqdm(tqdm):
     def __init__(self, *args, **kwargs):
         kwargs["disable"] = True
@@ -849,6 +858,8 @@ def safetensors_weights_iterator(
     loading_desc = "Loading safetensors checkpoint shards"
     if safetensors_load_strategy == "eager":
         loading_desc += " (eager)"
+    if _is_ple_offload_process():
+        loading_desc += "(PLE-offload)"
 
     sorted_files = sorted(hf_weights_files, key=_natural_sort_key)
 

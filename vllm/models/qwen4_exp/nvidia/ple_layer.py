@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+import vllm.envs as envs
 from vllm.config import CacheConfig, ModelConfig, VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.linear import ReplicatedLinear
@@ -17,6 +18,11 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
     is_conv_state_dim_first,
+)
+from vllm.model_executor.layers.ple_nvme import map_ple_weight
+from vllm.model_executor.layers.ple_offload_layer import (
+    PleOffloadLayer,
+    is_offload_process,
 )
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
@@ -36,6 +42,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.model_executor.parameter import PerTensorScaleParameter
+from vllm.model_executor.utils import set_weight_attrs
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
 )
@@ -140,6 +147,9 @@ class Qwen4ExpPLEGroupedNorm(nn.Module):
 class Qwen4ExpPLEFp8EmbeddingMethod(QuantizeMethodBase):
     """FP8 PLE embedding with one global checkpoint scale."""
 
+    def __init__(self, nvme_path: str | None = None) -> None:
+        self.nvme_path = nvme_path
+
     def create_weights(
         self,
         layer: nn.Module,
@@ -152,9 +162,24 @@ class Qwen4ExpPLEFp8EmbeddingMethod(QuantizeMethodBase):
     ) -> None:
         del input_size, output_size, params_dtype
         weight_loader = extra_weight_attrs.get("weight_loader")
-        weight = create_fp8_weight_parameter(
-            sum(output_partition_sizes), input_size_per_partition, weight_loader
-        )
+        output_size_per_partition = sum(output_partition_sizes)
+        if self.nvme_path is None:
+            weight = create_fp8_weight_parameter(
+                output_size_per_partition,
+                input_size_per_partition,
+                weight_loader,
+            )
+        else:
+            mapped_weight = map_ple_weight(
+                self.nvme_path,
+                expected_shape=(
+                    output_size_per_partition,
+                    input_size_per_partition,
+                ),
+            )
+            weight = nn.Parameter(mapped_weight, requires_grad=False)
+            set_weight_attrs(weight, extra_weight_attrs)
+            layer._ple_nvme_weight_preloaded = True
         layer.register_parameter("weight", weight)
 
         weight_scale = create_fp8_scale_parameter(
@@ -182,30 +207,38 @@ class Qwen4ExpPLEFp8EmbeddingMethod(QuantizeMethodBase):
 def _get_ple_embedding_quant_method(
     quant_config: QuantizationConfig | None,
     prefix: str,
+    ple_embedding_dtype: str | torch.dtype | None = None,
 ) -> QuantizeMethodBase | None:
     """Select global-scale FP8 only for quantized PLE checkpoint shards."""
 
-    if not isinstance(quant_config, Fp8Config):
-        return None
-    if not quant_config.is_checkpoint_fp8_serialized:
-        return None
+    if isinstance(quant_config, Fp8Config):
+        if not quant_config.is_checkpoint_fp8_serialized:
+            return None
 
-    ignored_layers = quant_config.ignored_layers
-    if is_layer_skipped(
-        prefix,
-        ignored_layers,
-        quant_config.packed_modules_mapping,
-        match_mode=quant_config.ignored_layers_match_mode,
+        ignored_layers = quant_config.ignored_layers
+        if is_layer_skipped(
+            prefix,
+            ignored_layers,
+            quant_config.packed_modules_mapping,
+            match_mode=quant_config.ignored_layers_match_mode,
+        ):
+            return None
+        # PLE checkpoint shards form one runtime embedding parameter.
+        shard_prefix = f"{prefix}.shard_"
+        if any(name.startswith(shard_prefix) for name in ignored_layers):
+            return None
+    elif ple_embedding_dtype not in (
+        "float8_e4m3fn",
+        "torch.float8_e4m3fn",
+        torch.float8_e4m3fn,
     ):
         return None
-    # PLE checkpoint shards form one runtime embedding parameter.
-    shard_prefix = f"{prefix}.shard_"
-    if any(name.startswith(shard_prefix) for name in ignored_layers):
-        return None
-    return Qwen4ExpPLEFp8EmbeddingMethod()
+
+    nvme_path = envs.VLLM_PLE_NVME_PATH if is_offload_process() else None
+    return Qwen4ExpPLEFp8EmbeddingMethod(nvme_path=nvme_path)
 
 
-class Qwen4ExpNGramEmbedding(nn.Module):
+class Qwen4ExpNGramEmbedding(PleOffloadLayer):
     def __init__(
         self,
         config: Qwen4ExpTextConfig,
@@ -283,7 +316,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             padding_size=divisor,
             prefix=f"{prefix}.ngram_embedding",
             quant_method=_get_ple_embedding_quant_method(
-                quant_config, f"{prefix}.ngram_embedding"
+                quant_config,
+                f"{prefix}.ngram_embedding",
+                ple_embedding_dtype=getattr(config, "ple_embedding_dtype", None),
             ),
         )
         self.register_buffer(
@@ -423,8 +458,54 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         )
         return self.ngram_embedding(ngram_ids).flatten(-2)
 
+    def get_offload_output_dtype(self, default_dtype: torch.dtype) -> torch.dtype:
+        """Keep quantized lookup results in their embedding storage dtype."""
+        embedding = getattr(self, "ngram_embedding", None)
+        weight = getattr(embedding, "weight", None)
+        if weight is not None:
+            return weight.dtype
+        if hasattr(self, "_offload_weight_scale"):
+            return torch.float8_e4m3fn
+        return default_dtype
+
+    def is_preloaded_checkpoint_weight(self, relative_name: str) -> bool:
+        """Skip numeric checkpoint shards when the flat table is mapped."""
+        embedding = getattr(self, "ngram_embedding", None)
+        if not getattr(embedding, "_ple_nvme_weight_preloaded", False):
+            return False
+        shard_prefix = "ngram_embedding.shard_"
+        shard_suffix = ".weight"
+        if not relative_name.startswith(shard_prefix) or not relative_name.endswith(
+            shard_suffix
+        ):
+            return False
+        shard_index = relative_name[len(shard_prefix) : -len(shard_suffix)]
+        return shard_index.isdigit()
+
+    def preloaded_parameter_names(self) -> set[str]:
+        """Account for the file-backed embedding in strict load checks."""
+        embedding = getattr(self, "ngram_embedding", None)
+        if getattr(embedding, "_ple_nvme_weight_preloaded", False):
+            return {"ngram_embedding.weight"}
+        return set()
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load hash buffers and checkpoint-split embedding rows."""
+
+        # GPU workers retain only the global FP8 scale. The CPU process owns the
+        # embedding weight and returns its quantized lookup output unchanged.
+        if envs.VLLM_PLE_CPU_OFFLOAD and not is_offload_process():
+            retained: set[str] = set()
+            for name, loaded_weight in weights:
+                if name != "ngram_embedding.weight_scale":
+                    continue
+                self.register_buffer(
+                    "_offload_weight_scale",
+                    loaded_weight.to(device=torch.accelerator.current_accelerator()),
+                    persistent=False,
+                )
+                retained.add(name)
+            return retained
 
         persistent_buffers = {
             "layer_multipliers": self.layer_multipliers,
@@ -576,7 +657,10 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
 
     def _get_embedding_weight_scale(self) -> torch.Tensor | None:
         embedding = getattr(self.ple_embedding, "ngram_embedding", None)
-        return getattr(embedding, "weight_scale", None)
+        weight_scale = getattr(embedding, "weight_scale", None)
+        if weight_scale is not None:
+            return weight_scale
+        return getattr(self.ple_embedding, "_offload_weight_scale", None)
 
     def _dequantize_embeddings(
         self,
@@ -1136,7 +1220,12 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                 f"token length, got {input_ids.shape[0]} and "
                 f"{hidden_states.shape[0]}"
             )
-        embeddings = self.ple_embedding(input_ids, query_start_loc, ngram_context)
+        embeddings = self.ple_embedding(
+            hidden_states,
+            input_ids,
+            query_start_loc,
+            ngram_context,
+        )
         embeddings = self._dequantize_embeddings(embeddings, hidden_states.dtype)
         key, _ = self.key_proj(embeddings)
         value, _ = self.value_proj(embeddings)

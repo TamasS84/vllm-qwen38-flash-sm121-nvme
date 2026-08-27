@@ -7,7 +7,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from vllm.config.compilation import CompilationConfig
+from vllm.config.compilation import CompilationConfig, CompilationMode
 from vllm.config.speculative import SpeculativeConfig
 from vllm.model_executor.models.config import (
     MODELS_CONFIG_MAP,
@@ -60,6 +60,100 @@ def test_qwen4_exp_framework_defaults_enable_architecture_features() -> None:
 
     assert config.hc_count == 2
     assert config.output_gate_type == "sigmoid"
+
+
+def test_qwen4_exp_lm_head_receives_quant_config() -> None:
+    from vllm.models.qwen4_exp.nvidia import model as model_module
+
+    quant_config = object()
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=_text_config(),
+            dtype=torch.bfloat16,
+        ),
+        quant_config=quant_config,
+        cache_config=SimpleNamespace(mamba_cache_mode="align"),
+        scheduler_config=SimpleNamespace(),
+    )
+    backbone = torch.nn.Module()
+    backbone.layers = []
+    backbone.make_empty_intermediate_tensors = lambda *args, **kwargs: None
+    head_kwargs = {}
+
+    def make_head(*args, **kwargs):
+        head_kwargs.update(kwargs)
+        return torch.nn.Identity()
+
+    with (
+        patch.object(model_module, "Qwen4ExpModel", return_value=backbone),
+        patch.object(model_module, "ParallelLMHead", side_effect=make_head),
+        patch.object(
+            model_module,
+            "LogitsProcessor",
+            return_value=torch.nn.Identity(),
+        ),
+        patch.object(
+            model_module,
+            "enable_qwen4_exp_low_latency_gemm",
+        ),
+        patch.object(
+            model_module.Qwen4ExpForCausalLM,
+            "set_moe_parameters",
+        ),
+    ):
+        model_module.Qwen4ExpForCausalLM(vllm_config=vllm_config)
+
+    assert head_kwargs["quant_config"] is quant_config
+
+
+def test_qwen4_exp_mtp_lm_head_receives_quant_config() -> None:
+    from vllm.models.qwen4_exp.nvidia import mtp as mtp_module
+
+    quant_config = object()
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=_text_config(tie_word_embeddings=False),
+            dtype=torch.bfloat16,
+        ),
+        quant_config=quant_config,
+        cache_config=SimpleNamespace(mamba_cache_mode="align"),
+        compilation_config=SimpleNamespace(mode=CompilationMode.NONE),
+    )
+    predictor = torch.nn.Module()
+    predictor.layers = []
+    predictor.make_empty_intermediate_tensors = lambda *args, **kwargs: None
+    head_kwargs = {}
+
+    def make_head(*args, **kwargs):
+        head_kwargs.update(kwargs)
+        return torch.nn.Identity()
+
+    with (
+        patch.object(
+            mtp_module,
+            "Qwen4ExpMultiTokenPredictor",
+            return_value=predictor,
+        ),
+        patch.object(
+            mtp_module,
+            "get_pp_group",
+            return_value=SimpleNamespace(is_last_rank=True),
+        ),
+        patch.object(mtp_module, "ParallelLMHead", side_effect=make_head),
+        patch.object(
+            mtp_module,
+            "LogitsProcessor",
+            return_value=torch.nn.Identity(),
+        ),
+        patch.object(
+            mtp_module,
+            "enable_qwen4_exp_low_latency_gemm",
+        ),
+        patch.object(mtp_module.Qwen4ExpMTP, "set_moe_parameters"),
+    ):
+        mtp_module.Qwen4ExpMTP(vllm_config=vllm_config)
+
+    assert head_kwargs["quant_config"] is quant_config
 
 
 def test_qwen4_exp_mtp_returns_sample_and_multi_streams() -> None:

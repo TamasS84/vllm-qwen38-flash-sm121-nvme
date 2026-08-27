@@ -11,6 +11,7 @@ from torch.nn import functional as F
 import vllm.model_executor.layers.vocab_parallel_embedding as embedding_module
 import vllm.model_executor.parameter as parameter_module
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4Config
 from vllm.models.qwen4_exp.common.ple import (
     PLEShardOverlap,
     compute_ple_shard_overlap,
@@ -156,6 +157,41 @@ def test_ngram_embedding_loads_fp8_shards_and_global_scale() -> None:
         torch.cat((shard_0[2:4], shard_1[0:2])).float(),
     )
     assert torch.equal(module.ngram_embedding.weight_scale, weight_scale)
+    assert module.get_offload_output_dtype(torch.bfloat16) == torch.float8_e4m3fn
+
+
+def test_ngram_gpu_offload_retains_only_fp8_global_scale(monkeypatch) -> None:
+    module = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
+    nn.Module.__init__(module)
+    weight_scale = torch.tensor([0.25], dtype=torch.bfloat16)
+    monkeypatch.setattr(ple_layer_module.envs, "VLLM_PLE_CPU_OFFLOAD", True)
+    monkeypatch.setattr(ple_layer_module, "is_offload_process", lambda: False)
+    monkeypatch.setattr(
+        torch.accelerator,
+        "current_accelerator",
+        lambda: torch.device("cpu"),
+    )
+
+    loaded = module.load_weights(
+        [
+            ("ngram_embedding.shard_0.weight", torch.empty(4, 2)),
+            ("ngram_embedding.weight_scale", weight_scale),
+        ]
+    )
+
+    assert loaded == {"ngram_embedding.weight_scale"}
+    assert torch.equal(module._offload_weight_scale, weight_scale)
+    assert module.get_offload_output_dtype(torch.bfloat16) == torch.float8_e4m3fn
+
+    ple_layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
+    nn.Module.__init__(ple_layer)
+    ple_layer.ple_embedding = module
+    embeddings = torch.tensor([[4.0, 8.0]]).to(torch.float8_e4m3fn)
+    output = ple_layer._dequantize_embeddings(embeddings, torch.bfloat16)
+    torch.testing.assert_close(
+        output,
+        torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16),
+    )
 
 
 def _make_fp8_embedding_layer(
@@ -308,6 +344,152 @@ def test_ple_ngram_ids_custom_op_uses_current_request_layout(monkeypatch) -> Non
         "ple",
     )
     assert torch.equal(output, torch.full_like(output, 2))
+
+
+def test_ple_fp8_embedding_selected_for_modelopt_nvfp4_checkpoint() -> None:
+    method = _get_ple_embedding_quant_method(
+        ModelOptNvFp4Config(is_checkpoint_nvfp4_serialized=True),
+        "model.layers.1.ple.ple_embedding.ngram_embedding",
+        ple_embedding_dtype="float8_e4m3fn",
+    )
+
+    assert isinstance(method, Qwen4ExpPLEFp8EmbeddingMethod)
+
+
+def test_ple_fp8_embedding_maps_nvme_weight_in_offload_process(monkeypatch) -> None:
+    mapped_weight = (
+        torch.arange(6, dtype=torch.uint8).view(torch.float8_e4m3fn).reshape(3, 2)
+    )
+    map_calls = []
+
+    def fake_map(path: str, expected_shape: tuple[int, int]) -> torch.Tensor:
+        map_calls.append((path, expected_shape))
+        return mapped_weight
+
+    monkeypatch.setattr(ple_layer_module, "map_ple_weight", fake_map)
+    monkeypatch.setattr(ple_layer_module, "is_offload_process", lambda: True)
+    monkeypatch.setenv("VLLM_PLE_NVME_PATH", "/ple/qwen38-flash.fp8")
+    monkeypatch.setattr(embedding_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        embedding_module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        parameter_module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+
+    method = _get_ple_embedding_quant_method(
+        ModelOptNvFp4Config(is_checkpoint_nvfp4_serialized=True),
+        "model.layers.1.ple.ple_embedding.ngram_embedding",
+        ple_embedding_dtype="float8_e4m3fn",
+    )
+    assert isinstance(method, Qwen4ExpPLEFp8EmbeddingMethod)
+    layer = embedding_module.VocabParallelEmbedding(
+        3,
+        2,
+        params_dtype=torch.bfloat16,
+        padding_size=1,
+        quant_method=method,
+    )
+
+    assert map_calls == [("/ple/qwen38-flash.fp8", (3, 2))]
+    assert layer.weight.data_ptr() == mapped_weight.data_ptr()
+    assert layer.weight.dtype == torch.float8_e4m3fn
+    assert layer._ple_nvme_weight_preloaded is True
+
+    outer = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
+    nn.Module.__init__(outer)
+    outer.ngram_embedding = layer
+    assert outer.is_preloaded_checkpoint_weight("ngram_embedding.shard_12.weight")
+    assert not outer.is_preloaded_checkpoint_weight(
+        "ngram_embedding.shard_invalid.weight"
+    )
+    assert not outer.is_preloaded_checkpoint_weight("ngram_embedding.weight_scale")
+    assert outer.preloaded_parameter_names() == {"ngram_embedding.weight"}
+
+
+def test_ngram_cpu_offload_padding_does_not_overwrite_real_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
+    nn.Module.__init__(module)
+    module.embedding_dim = 1
+    module.head_dim = 1
+    module.ngram_size = 2
+    module.heads_per_ngram = 1
+    module.eos_token_id = 99
+    module.register_buffer("positions_buffer", torch.arange(4))
+    module.register_buffer("padded_buffer", torch.empty(1, 4, dtype=torch.long))
+    module.register_buffer("layer_multipliers", torch.tensor([3, 5]))
+    module.register_buffer("ngram_heads_vocab_sizes", torch.tensor([101]))
+    module.register_buffer("ngram_heads_offsets", torch.tensor([0]))
+    module.ngram_embedding = nn.Embedding(101, 1)
+    module.ngram_embedding.weight.requires_grad_(False)
+    with torch.no_grad():
+        module.ngram_embedding.weight.copy_(torch.arange(101).reshape(-1, 1))
+
+    monkeypatch.setattr(ple_layer_module, "is_offload_process", lambda: True)
+    query_start_loc = torch.tensor([0, 2])
+    ngram_context = torch.full((1, 1), 99, dtype=torch.long)
+    expected = module.forward_impl(
+        torch.empty(2, 0),
+        torch.tensor([11, 13]),
+        query_start_loc,
+        ngram_context,
+        output_buffer=torch.empty(2, 1),
+    )
+    actual = module.forward_impl(
+        torch.empty(4, 0),
+        torch.tensor([11, 13, 777, 888]),
+        query_start_loc,
+        ngram_context,
+        output_buffer=torch.empty(4, 1),
+    )
+
+    torch.testing.assert_close(actual[:2], expected)
+
+
+def test_ngram_fp8_cpu_offload_preserves_quantized_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
+    nn.Module.__init__(module)
+    module.embedding_dim = 2
+    module.head_dim = 2
+    module.ngram_size = 2
+    module.heads_per_ngram = 1
+    module.eos_token_id = 99
+    module.register_buffer("positions_buffer", torch.arange(2))
+    module.register_buffer("padded_buffer", torch.empty(1, 2, dtype=torch.long))
+    module.register_buffer("layer_multipliers", torch.tensor([1, 1]))
+    module.register_buffer("ngram_heads_vocab_sizes", torch.tensor([3]))
+    module.register_buffer("ngram_heads_offsets", torch.tensor([0]))
+    module.ngram_embedding = _make_fp8_embedding_layer(monkeypatch)
+
+    monkeypatch.setattr(ple_layer_module, "is_offload_process", lambda: True)
+    hidden_states = torch.empty(2, 0)
+    input_ids = torch.tensor([0, 1])
+    query_start_loc = torch.tensor([0, 2])
+    ngram_context = torch.tensor([[99]])
+    quantized = module.forward_impl(
+        hidden_states,
+        input_ids,
+        query_start_loc,
+        ngram_context,
+    )
+    output_buffer = torch.empty(2, 2, dtype=torch.float8_e4m3fn)
+
+    output = module.forward_impl(
+        hidden_states,
+        input_ids,
+        query_start_loc,
+        ngram_context,
+        output_buffer=output_buffer,
+    )
+
+    assert output.data_ptr() == output_buffer.data_ptr()
+    assert output.dtype == torch.float8_e4m3fn
+    torch.testing.assert_close(output.float(), quantized.float())
 
 
 def test_dilated_ple_spec_state_rolls_back_before_next_forward() -> None:

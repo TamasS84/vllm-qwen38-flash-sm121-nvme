@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import subprocess
+import sys
 import tempfile
+import textwrap
 
 import huggingface_hub.constants
 import pytest
@@ -11,6 +14,35 @@ from vllm.model_executor.model_loader.weight_utils import (
     download_weights_from_hf,
     maybe_remap_kv_scale_name,
 )
+
+
+def test_weight_utils_import_does_not_require_ple_cuda_module() -> None:
+    code = textwrap.dedent(
+        """
+        import importlib.abc
+        import sys
+
+        class BlockPleOffloadImport(importlib.abc.MetaPathFinder):
+            def find_spec(self, fullname, path, target=None):
+                if fullname == "vllm.model_executor.layers.ple_offload_layer":
+                    raise ImportError("PLE CUDA module is unavailable")
+                return None
+
+        sys.meta_path.insert(0, BlockPleOffloadImport())
+        from vllm.model_executor.model_loader import weight_utils
+
+        assert callable(weight_utils.safetensors_weights_iterator)
+        """
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_download_weights_from_hf():

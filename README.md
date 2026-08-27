@@ -19,6 +19,18 @@ For events, please visit [vllm.ai/events](https://vllm.ai/events) to join us.
 
 ---
 
+## Qwen3.8 Flash on a single DGX Spark
+
+This fork's `qwen38-flash-sm121-nvme` branch adds native CUDA `sm_121a`
+builds for the GB10 DGX Spark and a Qwen3.8 Flash PLE offload path backed by a
+validated, memory-mapped NVMe sidecar. The supplied isolated launcher keeps an
+existing vLLM installation untouched and uses the model's native one-token MTP
+proposer. On the reference Spark it measured 23.94 decode tokens/s for a
+forced-128-token single-request workload, with the full 51.2 GB PLE table
+remaining file-backed.
+
+See the [DGX Spark build, launch, verification, and restore guide](examples/online_serving/qwen38_flash_nvme/README.md).
+
 ## About
 
 vLLM is a fast and easy-to-use library for LLM inference and serving.
