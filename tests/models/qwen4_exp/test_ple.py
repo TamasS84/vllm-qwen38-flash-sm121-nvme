@@ -346,6 +346,49 @@ def test_ple_ngram_ids_custom_op_uses_current_request_layout(monkeypatch) -> Non
     assert torch.equal(output, torch.full_like(output, 2))
 
 
+def test_ngram_gpu_path_uses_request_layout_custom_op(monkeypatch) -> None:
+    module = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
+    nn.Module.__init__(module)
+    module.ngram_heads = 2
+    module.layer_name = "ple"
+    module.ngram_embedding = nn.Embedding(4, 1)
+    module.ngram_embedding.weight.requires_grad_(False)
+    with torch.no_grad():
+        module.ngram_embedding.weight.copy_(torch.arange(4).reshape(-1, 1))
+
+    calls = []
+
+    def fake_compute(
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
+        output: torch.Tensor,
+        layer_name: str,
+    ) -> None:
+        calls.append((input_ids.clone(), query_start_loc.clone(), layer_name))
+        output.fill_(1)
+
+    monkeypatch.setattr(ple_layer_module, "is_offload_process", lambda: False)
+    monkeypatch.setattr(
+        torch.ops.vllm,
+        "qwen4_exp_compute_ple_ngram_ids",
+        fake_compute,
+    )
+
+    output = module.forward_impl(
+        torch.empty(2, 0),
+        torch.tensor([11, 13]),
+        torch.tensor([0, 2]),
+        torch.tensor([[99]]),
+    )
+
+    assert len(calls) == 1
+    assert torch.equal(calls[0][0], torch.tensor([11, 13]))
+    assert torch.equal(calls[0][1], torch.tensor([0, 2]))
+    assert calls[0][2] == "ple"
+    torch.testing.assert_close(output, torch.ones(2, 2))
+
+
 def test_ple_fp8_embedding_selected_for_modelopt_nvfp4_checkpoint() -> None:
     method = _get_ple_embedding_quant_method(
         ModelOptNvFp4Config(is_checkpoint_nvfp4_serialized=True),

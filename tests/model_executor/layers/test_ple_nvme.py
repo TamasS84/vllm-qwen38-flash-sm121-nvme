@@ -142,7 +142,7 @@ def test_nvme_config_accepts_complete_sidecar(tmp_path: Path) -> None:
     data_path = tmp_path / "ple.fp8"
     _write_sidecar(data_path)
 
-    assert validate_ple_nvme_config(
-        str(data_path), cpu_offload_enabled=True
-    ) == data_path
+    assert (
+        validate_ple_nvme_config(str(data_path), cpu_offload_enabled=True) == data_path
+    )
     assert validate_ple_nvme_config(None, cpu_offload_enabled=False) is None

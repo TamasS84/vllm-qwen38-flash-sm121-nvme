@@ -228,8 +228,7 @@ class Worker(WorkerBase):
             unsupported.append(f"device={current_platform.device_type}")
         if parallel_config.distributed_executor_backend != "mp":
             unsupported.append(
-                "executor backend="
-                f"{parallel_config.distributed_executor_backend}"
+                f"executor backend={parallel_config.distributed_executor_backend}"
             )
         if parallel_config.nnodes != 1:
             unsupported.append(f"nnodes={parallel_config.nnodes}")

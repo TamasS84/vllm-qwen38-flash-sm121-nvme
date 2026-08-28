@@ -11,9 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
-_PLE_SHARD_RE = re.compile(
-    r"(?:^|\.)ngram_embedding\.shard_(\d+)\.weight$"
-)
+_PLE_SHARD_RE = re.compile(r"(?:^|\.)ngram_embedding\.shard_(\d+)\.weight$")
 _COPY_BUFFER_SIZE = 16 * 1024 * 1024
 _FORMAT_VERSION = 1
 _FP8_DTYPE = "F8_E4M3"

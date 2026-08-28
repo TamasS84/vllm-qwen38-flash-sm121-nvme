@@ -10,8 +10,7 @@ import pytest
 from tools.prepare_ple_nvme import build_ple_sidecar
 
 _KEY_PREFIX = (
-    "model.language_model.model.layers.0.ple.ple_embedding."
-    "ngram_embedding.shard_"
+    "model.language_model.model.layers.0.ple.ple_embedding.ngram_embedding.shard_"
 )
 
 
@@ -63,9 +62,7 @@ def _write_model(
 
 def test_builds_sidecar_in_numeric_shard_order(tmp_path: Path) -> None:
     model_dir = tmp_path / "model"
-    tensors = [
-        (index, "F8_E4M3", [1, 1], bytes([index])) for index in range(11)
-    ]
+    tensors = [(index, "F8_E4M3", [1, 1], bytes([index])) for index in range(11)]
     _write_model(model_dir, tensors, split_ngram_parts=11)
     output_path = tmp_path / "ple.fp8"
 
