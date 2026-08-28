@@ -30,7 +30,9 @@ esac
 
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-$PROFILE_MAX_NUM_SEQS}
 MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-$PROFILE_MAX_NUM_BATCHED_TOKENS}
-KV_CACHE_MEMORY_BYTES=${KV_CACHE_MEMORY_BYTES:-12G}
+KV_CACHE_MEMORY_BYTES=${KV_CACHE_MEMORY_BYTES:-17G}
+PREFIX_CACHE_RETENTION_INTERVAL=${PREFIX_CACHE_RETENTION_INTERVAL:-12672}
+PREFIX_CACHE_SCHEDULER_PAGE_TOKENS=1584
 
 require_positive_integer() {
   local name=$1
@@ -43,6 +45,11 @@ require_positive_integer() {
 
 require_positive_integer MAX_NUM_SEQS "$MAX_NUM_SEQS"
 require_positive_integer MAX_NUM_BATCHED_TOKENS "$MAX_NUM_BATCHED_TOKENS"
+require_positive_integer PREFIX_CACHE_RETENTION_INTERVAL "$PREFIX_CACHE_RETENTION_INTERVAL"
+if (( PREFIX_CACHE_RETENTION_INTERVAL % PREFIX_CACHE_SCHEDULER_PAGE_TOKENS != 0 )); then
+  echo "PREFIX_CACHE_RETENTION_INTERVAL must be a multiple of $PREFIX_CACHE_SCHEDULER_PAGE_TOKENS, got: $PREFIX_CACHE_RETENTION_INTERVAL" >&2
+  exit 1
+fi
 if [[ ! "$KV_CACHE_MEMORY_BYTES" =~ ^[1-9][0-9]*([KMGTP]i?B?)?$ ]]; then
   echo "KV_CACHE_MEMORY_BYTES must be a positive byte size, got: $KV_CACHE_MEMORY_BYTES" >&2
   exit 1
@@ -103,7 +110,8 @@ mkdir -p "$CACHE_DIR" "$LOG_DIR"
   --reasoning-parser qwen3 \
   --enable-auto-tool-choice \
   --tool-call-parser qwen3_coder \
-  --no-enable-prefix-caching
+  --enable-prefix-caching \
+  --prefix-cache-retention-interval "$PREFIX_CACHE_RETENTION_INTERVAL"
 
 nohup "$DOCKER_BIN" logs --follow "$CONTAINER_NAME" \
   >"$LOG_DIR/server.log" 2>&1 &

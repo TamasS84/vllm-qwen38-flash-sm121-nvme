@@ -6,14 +6,17 @@ on port 8010. The launcher only replaces a container named
 
 The launcher uses TP1 with the multiprocessing executor required by PLE
 offload, text-only target-model CUDA graphs, the model's native one-token MTP
-proposer in eager mode, the full 262,144-token context, a BF16 KV cache, and no
-prefix caching. Qwen3.8 QSA requires the main KV cache to remain BF16. The
-default balanced profile schedules five concurrent requests with an
-8,192-token batch budget; the throughput profile schedules ten. A `0.82`
-GPU-memory-utilization budget leaves enough room for the weights, graph
-captures, and at least two full-length KV-cache sequences. The OpenAI server
-uses the `qwen3` reasoning parser and `qwen3_coder` tool parser, so private
-reasoning and structured tool calls are not mixed into visible content.
+proposer in eager mode, the full 262,144-token context, a BF16 KV cache, and
+automatic prefix caching. Qwen3.8 QSA requires the main KV cache to remain
+BF16. A 12,672-token retention interval keeps reusable checkpoints for the
+hybrid Mamba/QSA cache; vLLM's zero-retention default did not produce reusable
+prefixes for this model in repeated-prompt validation. The default balanced
+profile schedules five concurrent requests with an 8,192-token batch budget;
+the throughput profile schedules ten. The explicit 17 GiB KV-cache reservation
+leaves unified-memory headroom while exposing more than two full context
+windows of shared token capacity. The OpenAI server uses the `qwen3` reasoning
+parser and `qwen3_coder` tool parser, so private reasoning and structured tool
+calls are not mixed into visible content.
 
 ## Quick start on a new DGX Spark
 
@@ -92,15 +95,22 @@ MODEL_DIR="$QWEN38_ROOT/models/RadixArk/Qwen3.8-Flash-Next-NVFP4-W4A16-LMHead" \
   bash examples/online_serving/qwen38_flash_nvme/serve_dgx_spark.sh
 ```
 
-The launcher reserves 12 GiB for the BF16 KV cache by default. This provides
-room for more than one complete 262,144-token sequence while retaining host
-memory headroom on a 128 GB unified-memory system. Override the deterministic
-limit when a different capacity/headroom tradeoff is required:
+The launcher reserves 17 GiB for the BF16 KV cache by default. On the validated
+configuration this exposes 613,621 cache tokens, or 2.34 complete 262,144-token
+sequences, while retaining host-memory headroom on a 128 GB unified-memory
+system. Override the deterministic limit when a different capacity/headroom
+tradeoff is required:
 
 ```bash
-KV_CACHE_MEMORY_BYTES=16G \
+KV_CACHE_MEMORY_BYTES=14G \
   bash examples/online_serving/qwen38_flash_nvme/serve_dgx_spark.sh
 ```
+
+The launcher also sets `PREFIX_CACHE_RETENTION_INTERVAL=12672`. Larger values
+store fewer hybrid-cache checkpoints but can substantially reduce prefix hits;
+smaller values consume more cache blocks. Override it only after measuring the
+actual concurrent prompt mix, and keep it a positive multiple of the resolved
+1,584-token scheduler page on this model.
 
 Add `SERVING_PROFILE=throughput` to that command for the ten-request profile.
 Always build the image from the same checkout used to run the converter. An
@@ -286,10 +296,14 @@ Verified on a GB10 DGX Spark on 2026-08-28:
   assembled from 128 PLE checkpoint shards.
 - W4A16-head profile: the converted head shrank from 1,271,398,400 to
   357,580,804 bytes. The target plus one draft layer used 77.81 GiB. With the
-  deterministic 12 GiB KV-cache limit, vLLM exposed 443,397 KV-cache tokens,
-  or 1.69 full-length sequences; shorter concurrent requests share that same
-  token pool. The host retained about 21-22 GiB of available unified memory
-  after the full-context and ten-request verification runs.
+  deterministic 17 GiB KV-cache limit, vLLM exposed 613,621 KV-cache tokens,
+  or 2.34 full-length sequences; shorter concurrent requests share that same
+  token pool. The host retained about 13-16 GiB of available unified memory
+  during controlled concurrent long-context validation.
+- Prefix caching: three concurrent prompts totaling 500,000 tokens completed a
+  222.8-second cold pass and a 51.4-second repeated pass. The warm pass reused
+  392,832 tokens (78.6%) and was 4.34x faster. A 25,344-token interval was
+  rejected because it reused only 278,784 tokens and took 103.5 seconds warm.
 - API: `/health` returned HTTP 200. Exact-limit requests with 262,016 prompt
   tokens plus 128 generated tokens succeeded with exact returned usage
   validation.

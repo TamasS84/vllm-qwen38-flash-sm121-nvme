@@ -143,7 +143,7 @@ def test_serve_script_uses_isolated_nvme_configuration(
     assert "--gpu-memory-utilization" not in run_args
     assert _option(run_args, "--kv-cache-memory-bytes") == [
         "--kv-cache-memory-bytes",
-        "12G",
+        "17G",
     ]
     assert "--kv-cache-dtype" not in run_args
     assert _option(run_args, "--max-model-len") == [
@@ -169,7 +169,12 @@ def test_serve_script_uses_isolated_nvme_configuration(
         "--tool-call-parser",
         "qwen3_coder",
     ]
-    assert "--no-enable-prefix-caching" in run_args
+    assert "--enable-prefix-caching" in run_args
+    assert "--no-enable-prefix-caching" not in run_args
+    assert _option(run_args, "--prefix-cache-retention-interval") == [
+        "--prefix-cache-retention-interval",
+        "12672",
+    ]
 
 
 def test_serve_script_default_root_follows_home(
@@ -234,6 +239,7 @@ def test_serve_script_accepts_parallelism_and_mtp_overrides(
             "MAX_NUM_SEQS": "10",
             "MAX_NUM_BATCHED_TOKENS": "8192",
             "KV_CACHE_MEMORY_BYTES": "14G",
+            "PREFIX_CACHE_RETENTION_INTERVAL": "25344",
             "ENABLE_MTP": "0",
         },
     )
@@ -248,6 +254,10 @@ def test_serve_script_accepts_parallelism_and_mtp_overrides(
     assert _option(run_args, "--kv-cache-memory-bytes") == [
         "--kv-cache-memory-bytes",
         "14G",
+    ]
+    assert _option(run_args, "--prefix-cache-retention-interval") == [
+        "--prefix-cache-retention-interval",
+        "25344",
     ]
     assert "--speculative-config" not in run_args
 
@@ -302,6 +312,8 @@ def test_serve_script_rejects_unknown_serving_profile(
         ("MAX_NUM_SEQS", "1.5"),
         ("MAX_NUM_BATCHED_TOKENS", "0"),
         ("MAX_NUM_BATCHED_TOKENS", "eight"),
+        ("PREFIX_CACHE_RETENTION_INTERVAL", "0"),
+        ("PREFIX_CACHE_RETENTION_INTERVAL", "auto"),
     ],
 )
 def test_serve_script_rejects_invalid_numeric_overrides_before_docker(
@@ -341,6 +353,25 @@ def test_serve_script_rejects_invalid_kv_cache_size_before_docker(
 
     assert result.returncode != 0
     assert "KV_CACHE_MEMORY_BYTES must be a positive byte size" in result.stderr
+    assert calls == []
+
+
+def test_serve_script_rejects_misaligned_prefix_retention_before_docker(
+    tmp_path: Path,
+    fake_docker,
+) -> None:
+    root = tmp_path / "qwen38"
+    _create_runtime_fixture(root)
+
+    result, calls = _run_script(
+        SERVE_SCRIPT,
+        fake_docker,
+        qwen38_root=root,
+        extra_env={"PREFIX_CACHE_RETENTION_INTERVAL": "12673"},
+    )
+
+    assert result.returncode != 0
+    assert "must be a multiple of 1584" in result.stderr
     assert calls == []
 
 
