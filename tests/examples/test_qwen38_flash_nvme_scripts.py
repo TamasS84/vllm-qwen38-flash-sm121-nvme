@@ -140,9 +140,10 @@ def test_serve_script_uses_isolated_nvme_configuration(
         "mp",
     ]
     assert "--enforce-eager" not in run_args
-    assert _option(run_args, "--gpu-memory-utilization") == [
-        "--gpu-memory-utilization",
-        "0.82",
+    assert "--gpu-memory-utilization" not in run_args
+    assert _option(run_args, "--kv-cache-memory-bytes") == [
+        "--kv-cache-memory-bytes",
+        "12G",
     ]
     assert "--kv-cache-dtype" not in run_args
     assert _option(run_args, "--max-model-len") == [
@@ -232,6 +233,7 @@ def test_serve_script_accepts_parallelism_and_mtp_overrides(
         extra_env={
             "MAX_NUM_SEQS": "10",
             "MAX_NUM_BATCHED_TOKENS": "8192",
+            "KV_CACHE_MEMORY_BYTES": "14G",
             "ENABLE_MTP": "0",
         },
     )
@@ -242,6 +244,10 @@ def test_serve_script_accepts_parallelism_and_mtp_overrides(
     assert _option(run_args, "--max-num-batched-tokens") == [
         "--max-num-batched-tokens",
         "8192",
+    ]
+    assert _option(run_args, "--kv-cache-memory-bytes") == [
+        "--kv-cache-memory-bytes",
+        "14G",
     ]
     assert "--speculative-config" not in run_args
 
@@ -316,6 +322,25 @@ def test_serve_script_rejects_invalid_numeric_overrides_before_docker(
 
     assert result.returncode != 0
     assert f"{name} must be a positive integer" in result.stderr
+    assert calls == []
+
+
+def test_serve_script_rejects_invalid_kv_cache_size_before_docker(
+    tmp_path: Path,
+    fake_docker,
+) -> None:
+    root = tmp_path / "qwen38"
+    _create_runtime_fixture(root)
+
+    result, calls = _run_script(
+        SERVE_SCRIPT,
+        fake_docker,
+        qwen38_root=root,
+        extra_env={"KV_CACHE_MEMORY_BYTES": "all-of-it"},
+    )
+
+    assert result.returncode != 0
+    assert "KV_CACHE_MEMORY_BYTES must be a positive byte size" in result.stderr
     assert calls == []
 
 

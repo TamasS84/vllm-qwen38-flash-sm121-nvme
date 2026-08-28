@@ -30,6 +30,7 @@ esac
 
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-$PROFILE_MAX_NUM_SEQS}
 MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-$PROFILE_MAX_NUM_BATCHED_TOKENS}
+KV_CACHE_MEMORY_BYTES=${KV_CACHE_MEMORY_BYTES:-12G}
 
 require_positive_integer() {
   local name=$1
@@ -42,6 +43,10 @@ require_positive_integer() {
 
 require_positive_integer MAX_NUM_SEQS "$MAX_NUM_SEQS"
 require_positive_integer MAX_NUM_BATCHED_TOKENS "$MAX_NUM_BATCHED_TOKENS"
+if [[ ! "$KV_CACHE_MEMORY_BYTES" =~ ^[1-9][0-9]*([KMGTP]i?B?)?$ ]]; then
+  echo "KV_CACHE_MEMORY_BYTES must be a positive byte size, got: $KV_CACHE_MEMORY_BYTES" >&2
+  exit 1
+fi
 
 MTP_ARGS=()
 if [[ "$ENABLE_MTP" != "0" && "$ENABLE_MTP" != "1" ]]; then
@@ -89,7 +94,7 @@ mkdir -p "$CACHE_DIR" "$LOG_DIR"
   --language-model-only \
   --tensor-parallel-size 1 \
   --distributed-executor-backend mp \
-  --gpu-memory-utilization 0.82 \
+  --kv-cache-memory-bytes "$KV_CACHE_MEMORY_BYTES" \
   --max-model-len 262144 \
   --max-num-seqs "$MAX_NUM_SEQS" \
   --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS" \

@@ -92,6 +92,16 @@ MODEL_DIR="$QWEN38_ROOT/models/RadixArk/Qwen3.8-Flash-Next-NVFP4-W4A16-LMHead" \
   bash examples/online_serving/qwen38_flash_nvme/serve_dgx_spark.sh
 ```
 
+The launcher reserves 12 GiB for the BF16 KV cache by default. This provides
+room for more than one complete 262,144-token sequence while retaining host
+memory headroom on a 128 GB unified-memory system. Override the deterministic
+limit when a different capacity/headroom tradeoff is required:
+
+```bash
+KV_CACHE_MEMORY_BYTES=16G \
+  bash examples/online_serving/qwen38_flash_nvme/serve_dgx_spark.sh
+```
+
 Add `SERVING_PROFILE=throughput` to that command for the ten-request profile.
 Always build the image from the same checkout used to run the converter. An
 older image without the W4A16 LM-head loader will reject the converted
@@ -263,7 +273,7 @@ is large enough to keep that work out of this first usable version.
 
 ## First-run verification
 
-Verified on a GB10 DGX Spark on 2026-08-27:
+Verified on a GB10 DGX Spark on 2026-08-28:
 
 - Image: built locally from this branch with the included DGX Spark build
   script.
@@ -274,19 +284,15 @@ Verified on a GB10 DGX Spark on 2026-08-27:
   model-parallel configuration tests both passed.
 - Sidecar: exactly 51,200,245,760 bytes, shape `320001536 x 160`, FP8 E4M3,
   assembled from 128 PLE checkpoint shards.
-- Full-context BF16-head profile: the target plus one draft layer used
-  77.75 GiB. vLLM exposed 745,986 KV-cache tokens, or 2.85 full-length
-  sequences, at `--gpu-memory-utilization 0.82`.
 - W4A16-head profile: the converted head shrank from 1,271,398,400 to
-  357,580,804 bytes. With the throughput profile, startup reported 79.61 GiB
-  for weights and non-torch allocations, 2.10 GiB peak activation memory,
-  0.30 GiB for CUDA graphs, and 18.02 GiB for KV cache. vLLM exposed 665,096
-  KV-cache tokens, or 2.54 full-length sequences; shorter concurrent requests
-  share that same token pool. The primary GPU process used about 103.2 GiB
-  after the full-context and parallel verification runs.
+  357,580,804 bytes. The target plus one draft layer used 77.81 GiB. With the
+  deterministic 12 GiB KV-cache limit, vLLM exposed 443,397 KV-cache tokens,
+  or 1.69 full-length sequences; shorter concurrent requests share that same
+  token pool. The host retained about 21-22 GiB of available unified memory
+  after the full-context and ten-request verification runs.
 - API: `/health` returned HTTP 200. Exact-limit requests with 262,016 prompt
-  tokens plus 128 generated tokens succeeded with both heads; the W4A16 run
-  under the throughput profile completed with exact returned usage validation.
+  tokens plus 128 generated tokens succeeded with exact returned usage
+  validation.
 - OpenAI chat parsing: a thinking-enabled request returned private work in
   `message.reasoning`, the final answer in `message.content` with no `<think>`
   markup, and `completion_tokens_details.reasoning_tokens: 49`. An automatic
@@ -294,7 +300,7 @@ Verified on a GB10 DGX Spark on 2026-08-27:
   `get_weather` call.
 - NVMe residency after the W4A16 parallel, quality, and full-context
   request: the PLE process had one private `rw-p` mapping for `/ple/ple.fp8`.
-  The 50,000,240 kB mapping had `Rss: 4,821,428 kB` after the c10 and 256K
+  The 50,000,240 kB mapping had `Rss: 8,249,164 kB` after the c10 and 256K
   workloads, all private-clean, and `Anonymous: 0 kB`, so the full 51.2 GB
   table was not copied into anonymous RAM.
 
