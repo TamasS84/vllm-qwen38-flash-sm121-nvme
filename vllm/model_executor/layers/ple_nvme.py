@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Validation and file mapping for NVMe-backed FP8 PLE tables."""
 
+import ctypes
 import json
+import mmap
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -108,6 +110,18 @@ def map_ple_weight(
         size=manifest.byte_size,
         dtype=torch.uint8,
     )
+    libc = ctypes.CDLL(None, use_errno=True)
+    madvise = libc.madvise
+    madvise.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
+    madvise.restype = ctypes.c_int
+    madv_random = getattr(mmap, "MADV_RANDOM")  # noqa: B009
+    if madvise(
+        mapped_bytes.data_ptr(),
+        mapped_bytes.numel(),
+        madv_random,
+    ):
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), path)
     return mapped_bytes.view(torch.float8_e4m3fn).reshape(actual_shape)
 
 

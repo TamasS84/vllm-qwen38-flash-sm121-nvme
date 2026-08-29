@@ -60,6 +60,27 @@ def test_maps_private_fp8_weight_from_absolute_path(tmp_path: Path) -> None:
     assert data_path.read_bytes() == b"\x04\x05\x06\x07"
 
 
+@pytest.mark.skipif(
+    not Path("/proc/self/smaps").exists(),
+    reason="Linux smaps is required to inspect mmap advice",
+)
+def test_marks_ple_mapping_for_random_access(tmp_path: Path) -> None:
+    data_path = tmp_path / "ple.fp8"
+    _write_sidecar(data_path)
+
+    weight = map_ple_weight(data_path, expected_shape=(2, 2))
+
+    smaps = Path("/proc/self/smaps").read_text().splitlines()
+    mapping_index = next(
+        index for index, line in enumerate(smaps) if str(data_path) in line
+    )
+    vm_flags = next(
+        line for line in smaps[mapping_index + 1 :] if line.startswith("VmFlags:")
+    )
+    assert weight.shape == (2, 2)
+    assert "rr" in vm_flags.split()
+
+
 def test_loads_typed_manifest(tmp_path: Path) -> None:
     data_path = tmp_path / "ple.fp8"
     _write_sidecar(data_path)

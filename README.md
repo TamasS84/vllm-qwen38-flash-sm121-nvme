@@ -27,10 +27,12 @@ validated, memory-mapped NVMe sidecar. The supplied isolated launcher keeps an
 existing vLLM installation untouched and uses the model's native one-token MTP
 proposer, a 17 GiB BF16 KV cache, the full 262,144-token context, and automatic
 prefix caching with a hybrid-cache retention interval validated for concurrent
-agent sessions. On the reference Spark it measured 23.94 decode tokens/s for a
-forced-128-token single-request workload, while a repeated three-prompt
-500,000-token workload was 4.34x faster after cache warmup. The full 51.2 GB PLE
-table remained file-backed.
+agent sessions. Linux random-access advice prevents the kernel from reading
+large sequential ranges for sparse PLE lookups. On the reference Spark this cut
+NVMe reads for three cold 16K prompts from 110.6 GiB to 2.8 GiB and improved
+aggregate completion throughput from 0.78 to 1.41 token/s. Ten concurrent cold
+4K prompts generating 128 tokens reached 34.83 aggregate tokens/s. The full
+51.2 GB PLE table remained file-backed.
 
 See the [DGX Spark build, launch, verification, and restore guide](examples/online_serving/qwen38_flash_nvme/README.md).
 

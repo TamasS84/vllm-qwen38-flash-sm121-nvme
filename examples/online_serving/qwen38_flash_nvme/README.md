@@ -64,6 +64,16 @@ Both profiles retain the 262,144-token context limit. Concurrency does not
 reserve ten complete context windows up front; live requests share the KV
 cache and are admitted according to their actual combined token use.
 
+Treat 262,144 as a per-request capability, not as a safe budget for every
+parallel request. Use one active session when it may reach the full limit. For
+three concurrent agent sessions, keep each live history around 64K tokens or
+less (about 192K combined), and summarize or compact histories before they grow
+past that envelope. The scheduler can queue excess work safely, but three
+unrelated 128K-209K cold prompts on one Spark are a large prefill workload and
+will have minute-scale first-token latency even though they fit individually.
+Prefix caching only reuses an exact token prefix from the beginning of a
+request, so stable system prompts and append-only histories matter.
+
 The CUDA 13 ARM64 image is built locally and can take a long time on the first
 run. Model startup then takes roughly ten minutes. Follow the log, then press
 Ctrl-C when you want to return to the shell:
@@ -202,8 +212,9 @@ uv run --no-project python tools/prepare_ple_nvme.py \
 
 The builder streams raw SafeTensors ranges into one flat FP8 file and writes a
 validated JSON manifest. At runtime the PLE worker opens the table with a
-private file mapping; only lookup results are copied through the existing
-pinned CPU-to-GPU buffers.
+private file mapping and marks it for random access. This suppresses Linux
+read-ahead for sparse PLE row lookups; only lookup results are copied through
+the existing pinned CPU-to-GPU buffers.
 
 Build native CUDA 13 code for the DGX Spark architecture and start the isolated
 server:
@@ -283,7 +294,7 @@ is large enough to keep that work out of this first usable version.
 
 ## First-run verification
 
-Verified on a GB10 DGX Spark on 2026-08-28:
+Verified on a GB10 DGX Spark on 2026-08-29:
 
 - Image: built locally from this branch with the included DGX Spark build
   script.
@@ -304,6 +315,18 @@ Verified on a GB10 DGX Spark on 2026-08-28:
   222.8-second cold pass and a 51.4-second repeated pass. The warm pass reused
   392,832 tokens (78.6%) and was 4.34x faster. A 25,344-token interval was
   rejected because it reused only 278,784 tokens and took 103.5 seconds warm.
+- Random-access PLE mapping: three cold 16K prompts improved from 0.777 to
+  1.414 aggregate completion token/s while NVMe reads fell from about 110.6 GiB
+  to 2.8 GiB. Three cold 4K prompts improved from 2.95 to 7.19 aggregate
+  completion token/s. The live mapping exposed Linux's `rr` `VmFlags` marker.
+- Parallel generation: ten independent 4K prompts generating 128 tokens each
+  measured 18.97, 26.81, 30.49, and 34.83 aggregate token/s at concurrency 1,
+  3, 5, and 10 respectively, with no preemptions. Higher concurrency increases
+  total throughput but also increases each request's latency.
+- Full context: one cold 262,000-token request completed without preemption at
+  71.5% KV-cache use. A steady-state exact repeat reused 259,776 tokens (99.2%)
+  and reached its first token in 1.85 seconds. Three 64K prompts reached a 96.5%
+  steady-state prefix hit rate and completed together in 5.3 seconds.
 - API: `/health` returned HTTP 200. Exact-limit requests with 262,016 prompt
   tokens plus 128 generated tokens succeeded with exact returned usage
   validation.
